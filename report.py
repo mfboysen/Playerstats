@@ -471,7 +471,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="report",
         description="World Cup 2026 Player Statistics — Terminal Reports",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
 
     # player
     p_player = sub.add_parser("player", help="Show player info and stats")
@@ -522,6 +522,22 @@ def main() -> None:
         "top": cmd_top,
         "compare": cmd_compare,
     }
+
+    if not args.command:
+        console.print(
+            Panel(
+                "[bold]World Cup 2026 Player Statistics — Reports[/bold]\n\n"
+                "  [cyan]python report.py player \"Mbappe\"[/cyan]\n"
+                "  [cyan]python report.py team \"France\"[/cyan]\n"
+                "  [cyan]python report.py top --stat goals[/cyan]\n"
+                "  [cyan]python report.py compare --players \"Mbappe,Haaland\"[/cyan]\n\n"
+                "All commands accept [dim]--season YYYY[/dim] (default: 2025)\n\n"
+                "For full help:  [dim]python report.py --help[/dim]",
+                title="Usage",
+                border_style="blue",
+            )
+        )
+        sys.exit(0)
 
     handler = dispatch.get(args.command)
     if handler is None:

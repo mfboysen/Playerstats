@@ -305,7 +305,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="pipeline",
         description="World Cup 2026 Player Statistics Pipeline",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
 
     # init-db
     sub.add_parser("init-db", help="Initialise the DuckDB schema")
@@ -352,6 +352,24 @@ def main() -> None:
         "fetch-match-stats": cmd_fetch_match_stats,
         "run-all": cmd_run_all,
     }
+
+    if not args.command:
+        console.print(
+            Panel(
+                "[bold]World Cup 2026 Player Statistics Pipeline[/bold]\n\n"
+                "Run the steps below in order:\n\n"
+                "  [cyan]python pipeline.py init-db[/cyan]\n"
+                "  [cyan]python pipeline.py fetch-teams[/cyan]\n"
+                "  [cyan]python pipeline.py fetch-squads[/cyan]\n"
+                "  [cyan]python pipeline.py fetch-match-stats --leagues 39,140,78,135,61 --season 2025[/cyan]\n\n"
+                "Or run everything at once:\n\n"
+                "  [cyan]python pipeline.py run-all --season 2025[/cyan]\n\n"
+                "For full help:  [dim]python pipeline.py --help[/dim]",
+                title="Usage",
+                border_style="blue",
+            )
+        )
+        sys.exit(0)
 
     handler = dispatch.get(args.command)
     if handler is None:
