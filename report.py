@@ -66,8 +66,8 @@ def _player_info_panel(player: dict) -> Panel:
     return Panel("\n".join(lines), title="[cyan]Player Info[/cyan]", expand=False)
 
 
-def _make_stats_table(df, title: str = "Statistics") -> Table:
-    """Build a rich Table from a DataFrame of competition stats."""
+def _make_match_table(df, title: str = "Match-by-Match Statistics") -> Table:
+    """Build a rich Table from the per-match DataFrame returned by player_report."""
     table = Table(
         title=title,
         show_header=True,
@@ -76,31 +76,38 @@ def _make_stats_table(df, title: str = "Statistics") -> Table:
     )
 
     col_map = [
-        ("Club",          "club",             "cyan",    False),
-        ("Competition",   "competition",       "white",   False),
-        ("Apps",          "appearances",       "green",   False),
-        ("Mins",          "minutes",           "green",   False),
-        ("Goals",         "goals",             "yellow",  False),
-        ("Assists",       "assists",           "yellow",  False),
-        ("Shots",         "shots_total",       "white",   False),
-        ("On Target",     "shots_on_target",   "white",   False),
-        ("Key Passes",    "passes_key",        "white",   False),
-        ("Pass Acc%",     "pass_accuracy",     "white",   True),
-        ("Tackles",       "tackles_total",     "blue",    False),
-        ("Interceptions", "tackles_interceptions", "blue", False),
-        ("Yellow",        "yellow_cards",      "yellow",  False),
-        ("Red",           "red_cards",         "red",     False),
-        ("Rating",        "rating",            "cyan",    True),
+        ("Date",          "date",                  "white",  False),
+        ("Club",          "club_team",             "cyan",   False),
+        ("vs.",           "opponent",              "white",  False),
+        ("Competition",   "competition",           "white",  False),
+        ("Mins",          "minutes_played",        "green",  False),
+        ("Start",         "is_starter",            "green",  False),
+        ("Goals",         "goals",                 "yellow", False),
+        ("Assists",       "assists",               "yellow", False),
+        ("Shots",         "shots_total",           "white",  False),
+        ("On Target",     "shots_on_target",       "white",  False),
+        ("Key Pass",      "passes_key",            "white",  False),
+        ("Pass Acc%",     "pass_accuracy",         "white",  True),
+        ("Tackles",       "tackles_total",         "blue",   False),
+        ("Inter.",        "tackles_interceptions", "blue",   False),
+        ("Yellow",        "yellow_cards",          "yellow", False),
+        ("Red",           "red_cards",             "red",    False),
+        ("Rating",        "rating",                "cyan",   True),
     ]
 
-    for col_name, _, style, is_float in col_map:
-        table.add_column(col_name, style=style, justify="right" if col_name not in ("Club", "Competition") else "left")
+    for col_name, key, style, _ in col_map:
+        justify = "left" if key in ("date", "club_team", "opponent", "competition") else "right"
+        table.add_column(col_name, style=style, justify=justify)
 
     for _, row in df.iterrows():
         cells = []
-        for col_name, key, style, is_float in col_map:
+        for _, key, _, is_float in col_map:
             val = row.get(key)
-            if is_float:
+            if key == "is_starter":
+                cells.append("✓" if val else "sub")
+            elif key == "date" and val is not None:
+                cells.append(str(val)[:10])  # YYYY-MM-DD only
+            elif is_float:
                 cells.append(_fmt(val, decimals=2))
             else:
                 cells.append(_fmt(val))
@@ -110,30 +117,27 @@ def _make_stats_table(df, title: str = "Statistics") -> Table:
 
 
 def _make_totals_row(totals: dict) -> Table:
-    """Build a simple 1-row totals summary table."""
+    """Build a simple 1-row season totals summary table."""
     table = Table(title="Season Totals", header_style="bold green", show_header=True)
     keys = [
-        ("Goals",       "goals"),
-        ("Assists",     "assists"),
-        ("Apps",        "appearances"),
-        ("Minutes",     "minutes"),
-        ("Shots",       "shots_total"),
-        ("Key Passes",  "passes_key"),
-        ("Tackles",     "tackles_total"),
+        ("Matches",       "matches_played"),
+        ("Goals",         "goals"),
+        ("Assists",       "assists"),
+        ("Minutes",       "minutes_played"),
+        ("Shots",         "shots_total"),
+        ("Key Passes",    "passes_key"),
+        ("Tackles",       "tackles_total"),
         ("Interceptions", "tackles_interceptions"),
-        ("Yellow Cards", "yellow_cards"),
-        ("Penalties",   "penalty_scored"),
-        ("Avg Rating",  "avg_rating"),
+        ("Yellow Cards",  "yellow_cards"),
+        ("Penalties",     "penalty_scored"),
+        ("Avg Rating",    "avg_rating"),
     ]
     for col_name, _ in keys:
         table.add_column(col_name, justify="right")
     row_cells = []
-    for col_name, key in keys:
+    for _, key in keys:
         val = totals.get(key)
-        if key == "avg_rating":
-            row_cells.append(_fmt(val, decimals=2))
-        else:
-            row_cells.append(_fmt(val))
+        row_cells.append(_fmt(val, decimals=2 if key == "avg_rating" else 0))
     table.add_row(*row_cells)
     return table
 
@@ -198,13 +202,13 @@ def cmd_player(args: argparse.Namespace) -> None:
     console.print()
     console.print(_player_info_panel(report["player"]))
 
-    if report["stats_by_competition"].empty:
+    if report["matches"].empty:
         console.print(
-            f"[yellow]No stats found for season [bold]{season}[/bold].[/yellow]"
+            f"[yellow]No match stats found for season [bold]{season}[/bold].[/yellow]"
         )
     else:
         console.print()
-        console.print(_make_stats_table(report["stats_by_competition"]))
+        console.print(_make_match_table(report["matches"]))
         console.print()
         console.print(_make_totals_row(report["totals"]))
 
@@ -344,10 +348,10 @@ def cmd_top(args: argparse.Namespace) -> None:
         ("Position",    "position",     "white",  "left"),
         ("WC Team",     "world_cup_team", "green","left"),
         (stat_label,    stat,           "yellow", "right"),
-        ("Goals",       "goals",        "yellow", "right"),
-        ("Assists",     "assists",      "yellow", "right"),
-        ("Apps",        "appearances",  "white",  "right"),
-        ("Avg Rating",  "avg_rating",   "cyan",   "right"),
+        ("Goals",       "goals",          "yellow", "right"),
+        ("Assists",     "assists",        "yellow", "right"),
+        ("Matches",     "matches_played", "white",  "right"),
+        ("Avg Rating",  "avg_rating",     "cyan",   "right"),
     ]
     for col_name, _, style, justify in cols:
         table.add_column(col_name, style=style, justify=justify)

@@ -3,7 +3,11 @@ from .transform import (
     transform_teams,
     transform_players,
     transform_competitions,
-    transform_player_stats,
+    transform_competitions_from_fixtures,
+    transform_teams_from_fixtures,
+    transform_matches,
+    transform_match_player_stats,
+    enrich_players_from_stats,
     generate_date_dimension,
 )
 from .load import Loader
@@ -13,7 +17,11 @@ __all__ = [
     "transform_teams",
     "transform_players",
     "transform_competitions",
-    "transform_player_stats",
+    "transform_competitions_from_fixtures",
+    "transform_teams_from_fixtures",
+    "transform_matches",
+    "transform_match_player_stats",
+    "enrich_players_from_stats",
     "generate_date_dimension",
     "Loader",
 ]

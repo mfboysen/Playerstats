@@ -212,6 +212,61 @@ class FootballAPIClient:
             "total_pages": total_pages,
         }
 
+    def get_fixtures_page(self, league_id: int, season: int, page: int = 1) -> dict:
+        """
+        Fetch one page of fixtures for a league/season.
+
+        Returns:
+            dict with 'fixtures' (list) and 'total_pages' (int)
+        """
+        raw = self._get_with_paging(
+            "/fixtures",
+            params={"league": league_id, "season": season, "page": page},
+        )
+        return {
+            "fixtures": raw["response"],
+            "total_pages": raw["paging"].get("total", 1),
+        }
+
+    def get_all_fixtures(self, league_id: int, season: int) -> list:
+        """
+        Fetch all fixtures for a league/season across all pages.
+
+        Returns:
+            Flat list of raw fixture objects
+        """
+        logger.info("Fetching fixtures for league %d season %d...", league_id, season)
+        first = self.get_fixtures_page(league_id, season, page=1)
+        total_pages = first["total_pages"]
+        all_fixtures: list = list(first["fixtures"])
+
+        for page in range(2, total_pages + 1):
+            page_data = self.get_fixtures_page(league_id, season, page=page)
+            all_fixtures.extend(page_data["fixtures"])
+            logger.info(
+                "Fixtures league %d: page %d/%d (%d total)",
+                league_id, page, total_pages, len(all_fixtures),
+            )
+
+        logger.info(
+            "League %d season %d: %d fixtures fetched", league_id, season, len(all_fixtures)
+        )
+        return all_fixtures
+
+    def get_fixture_players(self, fixture_id: int) -> list:
+        """
+        Fetch player statistics for a single fixture.
+
+        Args:
+            fixture_id: API fixture ID
+
+        Returns:
+            List of team+players objects:
+            [{"team": {...}, "players": [{"player": {...}, "statistics": [...]}]}]
+        """
+        logger.debug("Fetching player stats for fixture_id=%d", fixture_id)
+        return self._get("/fixtures/players", params={"fixture": fixture_id})
+
     def get_all_league_players(self, league_id: int, season: int) -> list:
         """
         Fetch all players from a league across all pages.

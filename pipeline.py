@@ -36,9 +36,12 @@ from src.etl.transform import (
     enrich_players_from_stats,
     generate_date_dimension,
     transform_competitions,
-    transform_player_stats,
+    transform_competitions_from_fixtures,
+    transform_match_player_stats,
+    transform_matches,
     transform_players,
     transform_teams,
+    transform_teams_from_fixtures,
 )
 
 # ── Logging setup ────────────────────────────────────────────────────────────
@@ -180,165 +183,81 @@ def cmd_fetch_squads(args: argparse.Namespace) -> None:
     )
 
 
-def cmd_fetch_player_stats(args: argparse.Namespace) -> None:
-    """Fetch club-season stats for all players in the DB."""
-    season = args.season
-    world_cup_only = args.world_cup_only
-    console.print(
-        Panel(
-            f"[bold]Fetching player stats (season {season})[/bold]"
-            + (" [WC players only]" if world_cup_only else ""),
-            style="blue",
-        )
-    )
+def cmd_fetch_match_stats(args: argparse.Namespace) -> None:
+    """
+    Fetch per-match player statistics for one or more leagues.
 
-    with _make_db() as db:
-        if world_cup_only:
-            players_df = db.query(
-                "SELECT api_player_id FROM dim_player WHERE world_cup_team_id IS NOT NULL"
-            )
-        else:
-            players_df = db.query("SELECT api_player_id FROM dim_player")
+    For each league: downloads the fixture list, then for every completed
+    match fetches the player stats. Loads into dim_match + fact_player_match_stats.
 
-    if players_df.empty:
-        console.print(
-            "[yellow]No players in DB. Run [bold]fetch-squads[/bold] first.[/yellow]"
-        )
-        return
-
-    player_ids = [int(x) for x in players_df["api_player_id"].tolist()]
-    logger.info("Will fetch stats for %d players", len(player_ids))
-
-    # Warn about daily limits
-    estimated_calls = len(player_ids)
-    if estimated_calls > 80:
-        console.print(
-            f"[yellow]Warning:[/yellow] This will make ~[bold]{estimated_calls}[/bold] API calls. "
-            "Free tier allows 100/day. Consider running in batches.",
-        )
-
-    client = _make_client()
-    extractor = Extractor(client)
-    raw_stats = extractor.extract_player_stats(
-        player_ids=player_ids, seasons=[season]
-    )
-
-    with _make_db() as db:
-        loader = Loader(db)
-
-        # Upsert competitions
-        comp_rows = transform_competitions(raw_stats)
-        loader.upsert_competitions(comp_rows)
-
-        # Enrich / create players with full bio from stats responses
-        _df_ep = db.query("SELECT api_player_id, world_cup_team_id FROM dim_player")
-        existing_players = {
-            int(row["api_player_id"]): {
-                "world_cup_team_id": int(row["world_cup_team_id"]) if row.get("world_cup_team_id") is not None else None
-            }
-            for _, row in _df_ep.iterrows()
-        }
-        enriched_players = enrich_players_from_stats(raw_stats, existing_players)
-        loader.upsert_players(enriched_players)
-
-        # Upsert fact rows
-        player_id_map = loader.get_player_id_map()
-        team_id_map = loader.get_team_id_map()
-        comp_id_map = loader.get_competition_id_map()
-
-        # Ensure club teams referenced in stats exist in dim_team
-        _ensure_club_teams(db, loader, raw_stats, team_id_map)
-        team_id_map = loader.get_team_id_map()  # refresh after inserts
-
-        fact_rows = transform_player_stats(
-            raw_stats,
-            player_id_map=player_id_map,
-            team_id_map=team_id_map,
-            competition_id_map=comp_id_map,
-        )
-        n_facts = loader.upsert_player_stats(fact_rows)
-
-    _print_summary_table(
-        "fetch-player-stats summary",
-        {
-            "Season": season,
-            "Players queried": len(player_ids),
-            "Stat records fetched": len(raw_stats),
-            "Fact rows upserted": n_facts,
-            "API calls": client._request_count,
-        },
-    )
-
-
-def cmd_fetch_league_stats(args: argparse.Namespace) -> None:
-    """Fetch all player stats from specified top leagues."""
+    API call cost: ~2 calls per league (fixture pages) + 1 call per completed match.
+    A full Premier League season (~380 matches) costs ~382 calls.
+    """
     season = args.season
     league_ids = [int(x.strip()) for x in args.leagues.split(",") if x.strip()]
 
     console.print(
         Panel(
-            f"[bold]Fetching league stats (season {season})[/bold]\n"
-            f"Leagues: {league_ids}",
+            f"[bold]Fetching per-match player stats (season {season})[/bold]\n"
+            f"Leagues: {league_ids}\n"
+            "[dim]1 API call per completed match — may be large for full seasons[/dim]",
             style="blue",
         )
     )
 
-    # Rough call estimate
-    estimated = len(league_ids) * 20  # ~20 pages per league
-    if estimated > 80:
-        console.print(
-            f"[yellow]Warning:[/yellow] This could make ~[bold]{estimated}+[/bold] API calls "
-            "(free tier: 100/day).",
-        )
-
     client = _make_client()
     extractor = Extractor(client)
-    raw_stats = extractor.extract_league_stats(
+    enriched_fixtures = extractor.extract_match_stats(
         league_ids=league_ids, season=season
     )
+
+    if not enriched_fixtures:
+        console.print("[yellow]No completed fixtures found for the given leagues/season.[/yellow]")
+        return
 
     with _make_db() as db:
         loader = Loader(db)
 
-        # Competitions
-        comp_rows = transform_competitions(raw_stats)
+        # 1. Competitions
+        comp_rows = transform_competitions_from_fixtures(enriched_fixtures)
         loader.upsert_competitions(comp_rows)
 
-        # Ensure club teams exist
-        team_id_map = loader.get_team_id_map()
-        _ensure_club_teams(db, loader, raw_stats, team_id_map)
-        team_id_map = loader.get_team_id_map()
+        # 2. Club teams referenced in fixtures
+        team_rows = transform_teams_from_fixtures(enriched_fixtures)
+        existing_map = loader.get_team_id_map()
+        new_teams = [t for t in team_rows if t["api_team_id"] not in existing_map]
+        if new_teams:
+            loader.upsert_teams(new_teams)
 
-        # Enrich / create players
-        _df_ep2 = db.query("SELECT api_player_id, world_cup_team_id FROM dim_player")
-        existing_players = {
-            int(row["api_player_id"]): {
-                "world_cup_team_id": int(row["world_cup_team_id"]) if row.get("world_cup_team_id") is not None else None
-            }
-            for _, row in _df_ep2.iterrows()
-        }
-        enriched_players = enrich_players_from_stats(raw_stats, existing_players)
-        loader.upsert_players(enriched_players)
-
-        # Fact rows
-        player_id_map = loader.get_player_id_map()
         team_id_map = loader.get_team_id_map()
         comp_id_map = loader.get_competition_id_map()
 
-        fact_rows = transform_player_stats(
-            raw_stats,
+        # 3. Matches (dim_match)
+        match_rows = transform_matches(enriched_fixtures, team_id_map, comp_id_map)
+        n_matches = loader.upsert_matches(match_rows)
+
+        match_id_map = loader.get_match_id_map()
+        player_id_map = loader.get_player_id_map()
+        national_team_map = loader.get_national_team_map()
+
+        # 4. Fact rows
+        fact_rows = transform_match_player_stats(
+            enriched_fixtures,
             player_id_map=player_id_map,
+            match_id_map=match_id_map,
             team_id_map=team_id_map,
             competition_id_map=comp_id_map,
+            national_team_map=national_team_map,
         )
-        n_facts = loader.upsert_player_stats(fact_rows)
+        n_facts = loader.upsert_match_player_stats(fact_rows)
 
     _print_summary_table(
-        "fetch-league-stats summary",
+        "fetch-match-stats summary",
         {
             "Season": season,
             "Leagues": len(league_ids),
-            "Player-stat records": len(raw_stats),
+            "Fixtures processed": len(enriched_fixtures),
+            "Matches upserted": n_matches,
             "Fact rows upserted": n_facts,
             "API calls": client._request_count,
         },
@@ -348,82 +267,35 @@ def cmd_fetch_league_stats(args: argparse.Namespace) -> None:
 def cmd_run_all(args: argparse.Namespace) -> None:
     """Run the complete pipeline end-to-end."""
     season = args.season
+    league_ids = [int(x.strip()) for x in args.leagues.split(",") if x.strip()]
     console.print(
         Panel(
             f"[bold cyan]Running full pipeline (club season {season})[/bold cyan]\n"
-            "Steps: init-db → fetch-teams → fetch-squads → fetch-league-stats",
+            "Steps: init-db → fetch-teams → fetch-squads → fetch-match-stats\n"
+            "[dim]Note: fetch-match-stats makes 1 API call per completed match.[/dim]",
             style="cyan",
         )
     )
 
-    # Estimate total calls
-    league_ids = DEFAULT_LEAGUES
-    estimated = 1 + 32 + len(league_ids) * 20
-    console.print(
-        f"[yellow]Estimated API calls:[/yellow] ~[bold]{estimated}[/bold] "
-        "(free tier limit: 100/day — this may exceed it for all leagues).",
-    )
-
-    # Step 1 — init DB
     class FakeArgs:
         pass
 
     init_args = FakeArgs()
     cmd_init_db(init_args)
 
-    # Step 2 — teams
     team_args = FakeArgs()
     team_args.season = 2026
     cmd_fetch_teams(team_args)
 
-    # Step 3 — squads
     squad_args = FakeArgs()
     cmd_fetch_squads(squad_args)
 
-    # Step 4 — league stats
-    league_args = FakeArgs()
-    league_args.season = season
-    league_args.leagues = ",".join(str(lid) for lid in league_ids)
-    cmd_fetch_league_stats(league_args)
+    match_args = FakeArgs()
+    match_args.season = season
+    match_args.leagues = ",".join(str(lid) for lid in league_ids)
+    cmd_fetch_match_stats(match_args)
 
-    console.print(
-        Panel("[bold green]Pipeline complete![/bold green]", style="green")
-    )
-
-
-# ── Club-team helper ─────────────────────────────────────────────────────────
-
-def _ensure_club_teams(
-    db: Database, loader: Loader, raw_stats: list, existing_team_map: dict
-) -> None:
-    """
-    Insert club teams that appear in player stats but aren't in dim_team yet.
-    These are not World Cup teams, so is_world_cup_2026 = False.
-    """
-    new_teams = []
-    seen_api_ids = set(existing_team_map.keys())
-
-    for record in raw_stats:
-        for stat in record.get("statistics", []):
-            team = stat.get("team", {})
-            api_team_id = team.get("id")
-            if api_team_id is None or api_team_id in seen_api_ids:
-                continue
-            seen_api_ids.add(api_team_id)
-            new_teams.append(
-                {
-                    "api_team_id": api_team_id,
-                    "name": team.get("name", "Unknown"),
-                    "short_name": None,
-                    "country": None,
-                    "logo_url": team.get("logo"),
-                    "is_world_cup_2026": False,
-                }
-            )
-
-    if new_teams:
-        logger.info("Inserting %d new club teams into dim_team", len(new_teams))
-        loader.upsert_teams(new_teams)
+    console.print(Panel("[bold green]Pipeline complete![/bold green]", style="green"))
 
 
 # ── Argument parser ──────────────────────────────────────────────────────────
@@ -445,32 +317,26 @@ def build_parser() -> argparse.ArgumentParser:
     # fetch-squads
     sub.add_parser("fetch-squads", help="Fetch squad rosters for all WC teams in DB")
 
-    # fetch-player-stats
-    p_ps = sub.add_parser(
-        "fetch-player-stats", help="Fetch club-season stats for players in DB"
+    # fetch-match-stats
+    p_ms = sub.add_parser(
+        "fetch-match-stats",
+        help="Fetch per-match player stats for one or more leagues",
     )
-    p_ps.add_argument("--season", type=int, default=2025)
-    p_ps.add_argument(
-        "--world-cup-only",
-        action="store_true",
-        default=False,
-        help="Only fetch stats for players with a WC team assignment",
-    )
-
-    # fetch-league-stats
-    p_ls = sub.add_parser(
-        "fetch-league-stats", help="Fetch all player stats from top leagues"
-    )
-    p_ls.add_argument(
+    p_ms.add_argument(
         "--leagues",
         default=",".join(str(lid) for lid in DEFAULT_LEAGUES),
-        help="Comma-separated league IDs",
+        help="Comma-separated API league IDs (default: 9 top leagues)",
     )
-    p_ls.add_argument("--season", type=int, default=2025)
+    p_ms.add_argument("--season", type=int, default=2025)
 
     # run-all
     p_all = sub.add_parser("run-all", help="Run the complete pipeline")
     p_all.add_argument("--season", type=int, default=2025)
+    p_all.add_argument(
+        "--leagues",
+        default=",".join(str(lid) for lid in DEFAULT_LEAGUES),
+        help="Comma-separated league IDs for match stats",
+    )
 
     return parser
 
@@ -483,8 +349,7 @@ def main() -> None:
         "init-db": cmd_init_db,
         "fetch-teams": cmd_fetch_teams,
         "fetch-squads": cmd_fetch_squads,
-        "fetch-player-stats": cmd_fetch_player_stats,
-        "fetch-league-stats": cmd_fetch_league_stats,
+        "fetch-match-stats": cmd_fetch_match_stats,
         "run-all": cmd_run_all,
     }
 

@@ -42,6 +42,18 @@ class Loader:
         df = self.db.query("SELECT api_player_id, player_id FROM dim_player")
         return {int(k): int(v) for k, v in zip(df["api_player_id"], df["player_id"])}
 
+    def get_match_id_map(self) -> dict:
+        """Return {api_fixture_id: match_id} for all rows in dim_match."""
+        df = self.db.query("SELECT api_fixture_id, match_id FROM dim_match")
+        return {int(k): int(v) for k, v in zip(df["api_fixture_id"], df["match_id"])}
+
+    def get_national_team_map(self) -> dict:
+        """Return {api_player_id: national_team_id} for players with a WC team assigned."""
+        df = self.db.query(
+            "SELECT api_player_id, world_cup_team_id FROM dim_player WHERE world_cup_team_id IS NOT NULL"
+        )
+        return {int(row["api_player_id"]): int(row["world_cup_team_id"]) for _, row in df.iterrows()}
+
     def get_competition_id_map(self) -> dict:
         """Return {(api_league_id, season): competition_id} for all rows in dim_competition."""
         df = self.db.query(
@@ -237,71 +249,139 @@ class Loader:
         logger.info("upsert_competitions: processed %d rows", len(rows))
         return len(rows)
 
-    def upsert_player_stats(self, stats: list[dict]) -> int:
+    def upsert_matches(self, matches: list[dict]) -> int:
         """
-        Upsert fact_player_season_stats rows.
+        Upsert dim_match rows.
 
         Args:
-            stats: Output of transform_player_stats()
+            matches: Output of transform_matches()
+
+        Returns:
+            Number of rows processed
+        """
+        if not matches:
+            logger.info("upsert_matches: no rows to process")
+            return 0
+
+        existing_map = self.get_match_id_map()
+        next_id = max(existing_map.values(), default=0) + 1
+
+        sql = """
+            INSERT INTO dim_match (
+                match_id, api_fixture_id, date_key, competition_id,
+                home_team_id, away_team_id, home_goals, away_goals,
+                venue, city, round, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (api_fixture_id) DO UPDATE SET
+                date_key       = excluded.date_key,
+                competition_id = excluded.competition_id,
+                home_team_id   = excluded.home_team_id,
+                away_team_id   = excluded.away_team_id,
+                home_goals     = excluded.home_goals,
+                away_goals     = excluded.away_goals,
+                venue          = excluded.venue,
+                city           = excluded.city,
+                round          = excluded.round,
+                status         = excluded.status
+        """
+
+        rows = []
+        for m in matches:
+            api_id = m["api_fixture_id"]
+            if api_id in existing_map:
+                surrogate_id = existing_map[api_id]
+            else:
+                surrogate_id = next_id
+                existing_map[api_id] = surrogate_id
+                next_id += 1
+            rows.append(
+                (
+                    surrogate_id,
+                    api_id,
+                    m.get("date_key"),
+                    m.get("competition_id"),
+                    m.get("home_team_id"),
+                    m.get("away_team_id"),
+                    m.get("home_goals"),
+                    m.get("away_goals"),
+                    m.get("venue"),
+                    m.get("city"),
+                    m.get("round"),
+                    m.get("status"),
+                )
+            )
+
+        self.db.executemany(sql, rows)
+        logger.info("upsert_matches: processed %d rows", len(rows))
+        return len(rows)
+
+    def upsert_match_player_stats(self, stats: list[dict]) -> int:
+        """
+        Upsert fact_player_match_stats rows.
+
+        Args:
+            stats: Output of transform_match_player_stats()
 
         Returns:
             Number of rows processed
         """
         if not stats:
-            logger.info("upsert_player_stats: no rows to process")
+            logger.info("upsert_match_player_stats: no rows to process")
             return 0
 
-        # Build existing unique key -> stat_id map
         df = self.db.query(
-            "SELECT stat_id, player_id, team_id, competition_id FROM fact_player_season_stats"
+            "SELECT stat_id, player_id, match_id FROM fact_player_match_stats"
         )
         existing_map: dict[tuple, int] = {}
         for _, row in df.iterrows():
-            key = (int(row["player_id"]), int(row["team_id"]), int(row["competition_id"]))
+            key = (int(row["player_id"]), int(row["match_id"]))
             existing_map[key] = int(row["stat_id"])
 
         next_id = max(existing_map.values(), default=0) + 1
 
         sql = """
-            INSERT INTO fact_player_season_stats (
-                stat_id, player_id, team_id, competition_id,
-                appearances, lineups, minutes,
-                goals, assists, goals_conceded, saves,
-                shots_total, shots_on_target,
+            INSERT INTO fact_player_match_stats (
+                stat_id, player_id, match_id, date_key,
+                club_team_id, opponent_team_id, competition_id, national_team_id,
+                minutes_played, is_starter,
+                goals, assists, shots_total, shots_on_target, offsides,
                 passes_total, passes_key, pass_accuracy,
                 tackles_total, tackles_blocks, tackles_interceptions,
                 duels_total, duels_won,
                 dribbles_attempts, dribbles_success, dribbles_past,
                 fouls_drawn, fouls_committed,
-                yellow_cards, yellow_red_cards, red_cards,
-                penalty_won, penalty_committed, penalty_scored,
-                penalty_missed, penalty_saved,
+                yellow_cards, red_cards,
+                penalty_won, penalty_committed, penalty_scored, penalty_missed, penalty_saved,
+                saves, goals_conceded,
                 rating, updated_at
             ) VALUES (
                 ?, ?, ?, ?,
-                ?, ?, ?,
                 ?, ?, ?, ?,
                 ?, ?,
+                ?, ?, ?, ?, ?,
                 ?, ?, ?,
                 ?, ?, ?,
                 ?, ?,
                 ?, ?, ?,
                 ?, ?,
-                ?, ?, ?,
-                ?, ?, ?,
+                ?, ?,
+                ?, ?, ?, ?, ?,
                 ?, ?,
                 ?, ?
             )
-            ON CONFLICT (player_id, team_id, competition_id) DO UPDATE SET
-                appearances             = excluded.appearances,
-                lineups                 = excluded.lineups,
-                minutes                 = excluded.minutes,
+            ON CONFLICT (player_id, match_id) DO UPDATE SET
+                date_key                = excluded.date_key,
+                club_team_id            = excluded.club_team_id,
+                opponent_team_id        = excluded.opponent_team_id,
+                competition_id          = excluded.competition_id,
+                national_team_id        = excluded.national_team_id,
+                minutes_played          = excluded.minutes_played,
+                is_starter              = excluded.is_starter,
                 goals                   = excluded.goals,
                 assists                 = excluded.assists,
-                goals_conceded          = excluded.goals_conceded,
-                saves                   = excluded.saves,
                 shots_total             = excluded.shots_total,
                 shots_on_target         = excluded.shots_on_target,
+                offsides                = excluded.offsides,
                 passes_total            = excluded.passes_total,
                 passes_key              = excluded.passes_key,
                 pass_accuracy           = excluded.pass_accuracy,
@@ -316,43 +396,44 @@ class Loader:
                 fouls_drawn             = excluded.fouls_drawn,
                 fouls_committed         = excluded.fouls_committed,
                 yellow_cards            = excluded.yellow_cards,
-                yellow_red_cards        = excluded.yellow_red_cards,
                 red_cards               = excluded.red_cards,
                 penalty_won             = excluded.penalty_won,
                 penalty_committed       = excluded.penalty_committed,
                 penalty_scored          = excluded.penalty_scored,
                 penalty_missed          = excluded.penalty_missed,
                 penalty_saved           = excluded.penalty_saved,
+                saves                   = excluded.saves,
+                goals_conceded          = excluded.goals_conceded,
                 rating                  = excluded.rating,
                 updated_at              = excluded.updated_at
         """
 
-        now = datetime.now(timezone.utc).isoformat()
         rows = []
         for s in stats:
-            key = (s["player_id"], s["team_id"], s["competition_id"])
+            key = (s["player_id"], s["match_id"])
             if key in existing_map:
                 stat_id = existing_map[key]
             else:
                 stat_id = next_id
                 existing_map[key] = stat_id
                 next_id += 1
-
             rows.append(
                 (
                     stat_id,
                     s["player_id"],
-                    s["team_id"],
-                    s["competition_id"],
-                    s.get("appearances", 0),
-                    s.get("lineups", 0),
-                    s.get("minutes", 0),
+                    s["match_id"],
+                    s.get("date_key"),
+                    s["club_team_id"],
+                    s["opponent_team_id"],
+                    s.get("competition_id"),
+                    s.get("national_team_id"),
+                    s.get("minutes_played", 0),
+                    bool(s.get("is_starter", True)),
                     s.get("goals", 0),
                     s.get("assists", 0),
-                    s.get("goals_conceded", 0),
-                    s.get("saves", 0),
                     s.get("shots_total", 0),
                     s.get("shots_on_target", 0),
+                    s.get("offsides", 0),
                     s.get("passes_total", 0),
                     s.get("passes_key", 0),
                     s.get("pass_accuracy"),
@@ -367,20 +448,21 @@ class Loader:
                     s.get("fouls_drawn", 0),
                     s.get("fouls_committed", 0),
                     s.get("yellow_cards", 0),
-                    s.get("yellow_red_cards", 0),
                     s.get("red_cards", 0),
                     s.get("penalty_won", 0),
                     s.get("penalty_committed", 0),
                     s.get("penalty_scored", 0),
                     s.get("penalty_missed", 0),
                     s.get("penalty_saved", 0),
+                    s.get("saves", 0),
+                    s.get("goals_conceded", 0),
                     s.get("rating"),
-                    now,
+                    s.get("updated_at", datetime.now(timezone.utc).isoformat()),
                 )
             )
 
         self.db.executemany(sql, rows)
-        logger.info("upsert_player_stats: processed %d rows", len(rows))
+        logger.info("upsert_match_player_stats: processed %d rows", len(rows))
         return len(rows)
 
     def load_date_dimension(self, dates: list[dict]) -> int:
