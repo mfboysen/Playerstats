@@ -1,0 +1,438 @@
+"""
+ETL Transform layer — pure functions that convert raw API data into
+rows ready for DuckDB insertion.
+"""
+
+import logging
+from datetime import date, timedelta
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_MONTH_NAMES = [
+    "", "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+_DAY_NAMES = [
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+]
+
+
+def _safe_int(val, default: int = 0) -> int:
+    """Convert a possibly-None value to int, returning *default* on failure."""
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(val, default=None):
+    """Convert a possibly-None value to float, returning *default* on failure."""
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+# ---------------------------------------------------------------------------
+# Date dimension
+# ---------------------------------------------------------------------------
+
+def generate_date_dimension(
+    start_year: int = 2024, end_year: int = 2027
+) -> list[dict]:
+    """
+    Generate all calendar dates in [start_year, end_year] as dim_date rows.
+
+    Args:
+        start_year: First year (inclusive)
+        end_year: Last year (inclusive)
+
+    Returns:
+        List of dicts matching the dim_date schema
+    """
+    rows: list[dict] = []
+    start = date(start_year, 1, 1)
+    end = date(end_year, 12, 31)
+    current = start
+
+    while current <= end:
+        iso_dow = current.isoweekday()  # 1=Monday … 7=Sunday
+        dow_0indexed = iso_dow - 1       # 0=Monday … 6=Sunday
+        rows.append(
+            {
+                "date_key": int(current.strftime("%Y%m%d")),
+                "full_date": current.isoformat(),
+                "year": current.year,
+                "month": current.month,
+                "month_name": _MONTH_NAMES[current.month],
+                "quarter": (current.month - 1) // 3 + 1,
+                "week_of_year": int(current.strftime("%W")),
+                "day_of_week": dow_0indexed,
+                "day_name": _DAY_NAMES[dow_0indexed],
+                "is_weekend": dow_0indexed >= 5,  # Saturday=5, Sunday=6
+            }
+        )
+        current += timedelta(days=1)
+
+    logger.debug(
+        "Generated %d date rows (%d-%d)", len(rows), start_year, end_year
+    )
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Teams
+# ---------------------------------------------------------------------------
+
+def transform_teams(raw_teams: list) -> list[dict]:
+    """
+    Transform raw API team objects into dim_team rows.
+
+    The `team_id` (surrogate PK) is NOT assigned here — it is assigned
+    during load (using MAX(team_id)+1 or ON CONFLICT logic).
+
+    Args:
+        raw_teams: Raw objects from /teams endpoint
+
+    Returns:
+        List of dicts with keys matching dim_team columns (minus team_id)
+    """
+    rows: list[dict] = []
+    for entry in raw_teams:
+        team = entry.get("team", {})
+        api_id = team.get("id")
+        if api_id is None:
+            logger.warning("Skipping team with no API id: %s", entry)
+            continue
+        venue = entry.get("venue", {})
+        country = team.get("country") or (venue.get("city") and None)
+        rows.append(
+            {
+                "api_team_id": api_id,
+                "name": team.get("name", "Unknown"),
+                "short_name": team.get("code"),          # e.g. "FRA"
+                "country": team.get("country"),
+                "logo_url": team.get("logo"),
+                "is_world_cup_2026": True,
+            }
+        )
+
+    logger.debug("Transformed %d team rows", len(rows))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Players
+# ---------------------------------------------------------------------------
+
+def transform_players(raw_squads: list, wc_team_map: dict) -> list[dict]:
+    """
+    Transform squad data into dim_player rows.
+
+    Args:
+        raw_squads: Output of Extractor.extract_world_cup_squads — list of
+                    {"team_id": api_team_id, "team_name": str, "players": [...]}
+        wc_team_map: Mapping of api_team_id -> team_id (DB surrogate key)
+
+    Returns:
+        List of dicts with keys matching dim_player columns (minus player_id)
+    """
+    seen_player_ids: set[int] = set()
+    rows: list[dict] = []
+
+    for squad_entry in raw_squads:
+        api_team_id = squad_entry.get("team_id")
+        db_team_id = wc_team_map.get(api_team_id)
+
+        for player in squad_entry.get("players", []):
+            api_player_id = player.get("id")
+            if api_player_id is None:
+                continue
+            if api_player_id in seen_player_ids:
+                continue
+            seen_player_ids.add(api_player_id)
+
+            rows.append(
+                {
+                    "api_player_id": api_player_id,
+                    "name": player.get("name", "Unknown"),
+                    "firstname": player.get("firstname"),
+                    "lastname": player.get("lastname"),
+                    "nationality": None,         # squads endpoint doesn't include nationality
+                    "birth_date": None,          # squads endpoint doesn't include birth info
+                    "age": player.get("age"),
+                    "height": None,
+                    "weight": None,
+                    "position": player.get("position"),
+                    "photo_url": player.get("photo"),
+                    "world_cup_team_id": db_team_id,
+                }
+            )
+
+    logger.debug("Transformed %d player rows from squads", len(rows))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Competitions
+# ---------------------------------------------------------------------------
+
+def transform_competitions(raw_player_stats: list) -> list[dict]:
+    """
+    Extract unique competition records from player-stats API responses.
+
+    Args:
+        raw_player_stats: Flat list of raw player+statistics dicts
+
+    Returns:
+        List of dicts with keys matching dim_competition columns (minus competition_id)
+    """
+    seen: dict[tuple[int, int], dict] = {}  # (api_league_id, season) -> row
+
+    for record in raw_player_stats:
+        for stat in record.get("statistics", []):
+            league = stat.get("league", {})
+            api_league_id = league.get("id")
+            season = league.get("season")
+            if api_league_id is None or season is None:
+                continue
+            key = (api_league_id, season)
+            if key in seen:
+                continue
+
+            # Infer type from league name/country heuristics
+            name = league.get("name", "")
+            country = league.get("country")
+            if country in ("World", None) or "world cup" in name.lower() or "champions" in name.lower():
+                comp_type = "International"
+            elif "cup" in name.lower() or "fa cup" in name.lower():
+                comp_type = "Cup"
+            else:
+                comp_type = "League"
+
+            seen[key] = {
+                "api_league_id": api_league_id,
+                "name": name,
+                "type": comp_type,
+                "country": country,
+                "logo_url": league.get("logo"),
+                "season": season,
+            }
+
+    rows = list(seen.values())
+    logger.debug("Transformed %d unique competition rows", len(rows))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Player season stats (fact)
+# ---------------------------------------------------------------------------
+
+def transform_player_stats(
+    raw_player_stats: list,
+    player_id_map: dict,
+    team_id_map: dict,
+    competition_id_map: dict,
+) -> list[dict]:
+    """
+    Transform raw player statistics into fact_player_season_stats rows.
+
+    Args:
+        raw_player_stats: Flat list of raw player+statistics dicts from the API
+        player_id_map: {api_player_id -> player_id} (DB surrogate keys)
+        team_id_map: {api_team_id -> team_id}
+        competition_id_map: {(api_league_id, season) -> competition_id}
+
+    Returns:
+        List of dicts with keys matching fact_player_season_stats columns
+        (minus stat_id).  Rows where any FK is missing are skipped.
+    """
+    rows: list[dict] = []
+    skipped_player = 0
+    skipped_team = 0
+    skipped_comp = 0
+
+    for record in raw_player_stats:
+        player_info = record.get("player", {})
+        api_player_id = player_info.get("id")
+        player_id = player_id_map.get(api_player_id)
+
+        if player_id is None:
+            skipped_player += 1
+            logger.debug(
+                "Skipping stats for unknown api_player_id=%s", api_player_id
+            )
+            continue
+
+        for stat in record.get("statistics", []):
+            team_info = stat.get("team", {})
+            api_team_id = team_info.get("id")
+            team_id = team_id_map.get(api_team_id)
+            if team_id is None:
+                skipped_team += 1
+                logger.debug(
+                    "Skipping stat row: unknown api_team_id=%s for player %s",
+                    api_team_id,
+                    api_player_id,
+                )
+                continue
+
+            league = stat.get("league", {})
+            api_league_id = league.get("id")
+            season = league.get("season")
+            competition_id = competition_id_map.get((api_league_id, season))
+            if competition_id is None:
+                skipped_comp += 1
+                logger.debug(
+                    "Skipping stat row: unknown competition (%s, %s) for player %s",
+                    api_league_id,
+                    season,
+                    api_player_id,
+                )
+                continue
+
+            games = stat.get("games", {})
+            goals_data = stat.get("goals", {})
+            shots = stat.get("shots", {})
+            passes = stat.get("passes", {})
+            tackles = stat.get("tackles", {})
+            duels = stat.get("duels", {})
+            dribbles = stat.get("dribbles", {})
+            fouls = stat.get("fouls", {})
+            cards = stat.get("cards", {})
+            penalty = stat.get("penalty", {})
+
+            rating_raw = games.get("rating")
+            rating = _safe_float(rating_raw)
+
+            pass_accuracy_raw = passes.get("accuracy")
+            pass_accuracy = _safe_float(pass_accuracy_raw)
+
+            rows.append(
+                {
+                    "player_id": player_id,
+                    "team_id": team_id,
+                    "competition_id": competition_id,
+                    # Appearances
+                    "appearances": _safe_int(games.get("appearences")),
+                    "lineups": _safe_int(games.get("lineups")),
+                    "minutes": _safe_int(games.get("minutes")),
+                    # Goals & Assists
+                    "goals": _safe_int(goals_data.get("total")),
+                    "assists": _safe_int(goals_data.get("assists")),
+                    "goals_conceded": _safe_int(goals_data.get("conceded")),
+                    "saves": _safe_int(goals_data.get("saves")),
+                    # Shots
+                    "shots_total": _safe_int(shots.get("total")),
+                    "shots_on_target": _safe_int(shots.get("on")),
+                    # Passes
+                    "passes_total": _safe_int(passes.get("total")),
+                    "passes_key": _safe_int(passes.get("key")),
+                    "pass_accuracy": pass_accuracy,
+                    # Defense
+                    "tackles_total": _safe_int(tackles.get("total")),
+                    "tackles_blocks": _safe_int(tackles.get("blocks")),
+                    "tackles_interceptions": _safe_int(tackles.get("interceptions")),
+                    # Duels
+                    "duels_total": _safe_int(duels.get("total")),
+                    "duels_won": _safe_int(duels.get("won")),
+                    # Dribbles
+                    "dribbles_attempts": _safe_int(dribbles.get("attempts")),
+                    "dribbles_success": _safe_int(dribbles.get("success")),
+                    "dribbles_past": _safe_int(dribbles.get("past")),
+                    # Discipline
+                    "fouls_drawn": _safe_int(fouls.get("drawn")),
+                    "fouls_committed": _safe_int(fouls.get("committed")),
+                    "yellow_cards": _safe_int(cards.get("yellow")),
+                    "yellow_red_cards": _safe_int(cards.get("yellowred")),
+                    "red_cards": _safe_int(cards.get("red")),
+                    # Penalties
+                    "penalty_won": _safe_int(penalty.get("won")),
+                    "penalty_committed": _safe_int(penalty.get("commited")),  # typo in API
+                    "penalty_scored": _safe_int(penalty.get("scored")),
+                    "penalty_missed": _safe_int(penalty.get("missed")),
+                    "penalty_saved": _safe_int(penalty.get("saved")),
+                    # Rating
+                    "rating": rating,
+                }
+            )
+
+    logger.info(
+        "Transformed %d fact rows (skipped: %d no-player, %d no-team, %d no-comp)",
+        len(rows),
+        skipped_player,
+        skipped_team,
+        skipped_comp,
+    )
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Player enrichment from full player-stats responses
+# ---------------------------------------------------------------------------
+
+def enrich_players_from_stats(
+    raw_player_stats: list,
+    existing_players: dict,
+) -> list[dict]:
+    """
+    Extract / update dim_player rows from full player-stats API responses.
+
+    Players returned by /players?id=... or /players?league=... include
+    full bio (nationality, birth date, height, weight) that squad responses
+    lack.  This function produces updated rows for existing players and
+    new rows for players not yet in the DB.
+
+    Args:
+        raw_player_stats: Flat list of raw API player+statistics dicts
+        existing_players: {api_player_id -> {"world_cup_team_id": ...}}
+                          — used to preserve world_cup_team_id
+
+    Returns:
+        List of dicts with keys matching dim_player columns (minus player_id)
+    """
+    seen: dict[int, dict] = {}
+
+    for record in raw_player_stats:
+        player_info = record.get("player", {})
+        api_player_id = player_info.get("id")
+        if api_player_id is None or api_player_id in seen:
+            continue
+
+        birth = player_info.get("birth", {})
+        birth_date_str = birth.get("date")
+
+        # Derive position from first statistics entry if available
+        position = None
+        for stat in record.get("statistics", []):
+            position = stat.get("games", {}).get("position")
+            if position:
+                break
+
+        existing = existing_players.get(api_player_id, {})
+        seen[api_player_id] = {
+            "api_player_id": api_player_id,
+            "name": player_info.get("name", "Unknown"),
+            "firstname": player_info.get("firstname"),
+            "lastname": player_info.get("lastname"),
+            "nationality": player_info.get("nationality"),
+            "birth_date": birth_date_str,
+            "age": player_info.get("age"),
+            "height": player_info.get("height"),
+            "weight": player_info.get("weight"),
+            "position": position,
+            "photo_url": player_info.get("photo"),
+            "world_cup_team_id": existing.get("world_cup_team_id"),
+        }
+
+    rows = list(seen.values())
+    logger.debug("Enriched/created %d player rows from stats responses", len(rows))
+    return rows
