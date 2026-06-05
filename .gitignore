@@ -55,7 +55,6 @@ cover/
 
 # Jupyter
 .ipynb_checkpoints
-*.ipynb
 
 # Distribution / packaging
 htmlcov/
