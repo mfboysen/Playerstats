@@ -162,7 +162,7 @@ CREATE TABLE IF NOT EXISTS fact_player_match_stats (
 -- -----------------------------------------------------
 -- View: v_player_season_summary
 -- Aggregates all matches per player per competition/season.
--- Use this for season-level analysis; filter by national_team_id
+-- Use this for season-level analysis. Filter by national_team_id
 -- to scope to World Cup squads.
 -- -----------------------------------------------------
 CREATE VIEW IF NOT EXISTS v_player_season_summary AS

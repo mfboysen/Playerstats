@@ -5,6 +5,7 @@ DuckDB database connection and helper utilities.
 import logging
 import os
 import pathlib
+import re
 from typing import Any
 
 import duckdb
@@ -46,8 +47,10 @@ class Database:
         with open(path, "r", encoding="utf-8") as fh:
             sql = fh.read()
 
-        # Execute statement by statement so errors are easier to pinpoint
-        statements = [s.strip() for s in sql.split(";") if s.strip()]
+        # Strip line comments before splitting on ; so semicolons inside
+        # comments don't produce phantom statements.
+        sql_no_comments = re.sub(r"--[^\n]*", "", sql)
+        statements = [s.strip() for s in sql_no_comments.split(";") if s.strip()]
         for stmt in statements:
             logger.debug("Executing DDL: %s...", stmt[:60])
             self._conn.execute(stmt)
