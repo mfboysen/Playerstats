@@ -151,7 +151,116 @@ class Extractor:
         return results
 
     # ------------------------------------------------------------------
-    # Match-level stats  (fixture list → per-fixture player stats)
+    # Player-first match stats (World Cup players → their clubs → fixtures)
+    # ------------------------------------------------------------------
+
+    def extract_wc_player_match_stats(
+        self,
+        wc_club_teams: list[dict],
+        season: int,
+    ) -> list[dict]:
+        """
+        Fetch per-match player stats for every club that has a World Cup player.
+
+        Strategy:
+        1. For each unique club team, fetch all completed fixtures.
+        2. For each fixture (deduplicated across clubs), fetch player stats.
+        3. Return enriched fixture objects — the transform layer will
+           automatically ignore non-WC players because their IDs won't be
+           in dim_player.
+
+        Args:
+            wc_club_teams: List of {"api_team_id", "name"} dicts for each
+                           unique club team that employs at least one WC player.
+            season: Club season year (e.g. 2025)
+
+        Returns:
+            Flat list of enriched fixture objects (same shape as
+            extract_match_stats output).
+        """
+        seen_fixture_ids: set[int] = set()
+        results: list[dict] = []
+
+        logger.info(
+            "Extracting WC player match stats: %d unique clubs, season %d",
+            len(wc_club_teams),
+            season,
+        )
+
+        for club in wc_club_teams:
+            api_team_id = club["api_team_id"]
+            team_name = club.get("name", str(api_team_id))
+            logger.info("Fetching fixtures for club '%s' (id=%d)", team_name, api_team_id)
+
+            try:
+                raw_fixtures = self.client.get_fixtures_by_team(api_team_id, season)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to fetch fixtures for club %d: %s", api_team_id, exc
+                )
+                continue
+
+            new_fixtures = [
+                f for f in raw_fixtures
+                if f.get("fixture", {}).get("id") not in seen_fixture_ids
+            ]
+            logger.info(
+                "Club '%s': %d fixtures, %d new (not yet fetched)",
+                team_name, len(raw_fixtures), len(new_fixtures),
+            )
+
+            for raw_fix in new_fixtures:
+                fix_meta = raw_fix.get("fixture", {})
+                fixture_id = fix_meta.get("id")
+                if fixture_id is None:
+                    continue
+                seen_fixture_ids.add(fixture_id)
+
+                league_meta = raw_fix.get("league", {})
+                teams_meta = raw_fix.get("teams", {})
+                goals_meta = raw_fix.get("goals", {})
+                venue_meta = fix_meta.get("venue", {})
+
+                try:
+                    team_players = self.client.get_fixture_players(fixture_id)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed player stats for fixture_id=%d: %s", fixture_id, exc
+                    )
+                    team_players = []
+
+                results.append(
+                    {
+                        "fixture_id": fixture_id,
+                        "fixture_date": fix_meta.get("date"),
+                        "competition": {
+                            "id": league_meta.get("id"),
+                            "name": league_meta.get("name"),
+                            "country": league_meta.get("country"),
+                            "logo": league_meta.get("logo"),
+                            "season": league_meta.get("season"),
+                        },
+                        "home_team": teams_meta.get("home", {}),
+                        "away_team": teams_meta.get("away", {}),
+                        "home_goals": goals_meta.get("home"),
+                        "away_goals": goals_meta.get("away"),
+                        "venue": venue_meta.get("name"),
+                        "city": venue_meta.get("city"),
+                        "round": league_meta.get("round"),
+                        "status": fix_meta.get("status", {}).get("long"),
+                        "team_players": team_players,
+                    }
+                )
+
+        logger.info(
+            "WC player match stats: %d unique fixtures across %d clubs",
+            len(results),
+            len(wc_club_teams),
+        )
+        return results
+
+    # ------------------------------------------------------------------
+    # Match-level stats  (league fixture list → per-fixture player stats)
     # ------------------------------------------------------------------
 
     def extract_match_stats(

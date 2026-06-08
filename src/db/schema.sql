@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS dim_player (
     weight              VARCHAR,
     position            VARCHAR,           -- Goalkeeper, Defender, Midfielder, Attacker
     photo_url           VARCHAR,
-    world_cup_team_id   INTEGER REFERENCES dim_team(team_id)
+    world_cup_team_id   INTEGER REFERENCES dim_team(team_id),
+    club_team_id        INTEGER REFERENCES dim_team(team_id)
 );
 
 -- -----------------------------------------------------

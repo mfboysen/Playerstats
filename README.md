@@ -61,36 +61,32 @@ Downloads the squad (player list) for every World Cup team loaded in step 2.
 python pipeline.py fetch-squads
 ```
 
-### Step 4 — Fetch per-match player statistics
+### Step 4 — Enrich players (club team + bio)
 
-Downloads player stats for every completed match in the specified leagues and season. **This is the main data step** — it populates the fact table with one row per player per game.
+For each WC player, fetches their full profile for the given season: club team, nationality, height, weight, birth date.
 
 ```bash
-# Default: top 9 leagues, season 2025
-python pipeline.py fetch-match-stats
-
-# Specify leagues and/or season
-python pipeline.py fetch-match-stats --leagues 39,140,78,135,61 --season 2025
+python pipeline.py enrich-players
+python pipeline.py enrich-players --season 2025   # default
 ```
 
-**API call cost:** ~2–3 calls to get the fixture list per league, then **1 call per completed match**. A full Premier League season (~380 matches) costs ~382 calls. Plan accordingly if you are on the free tier (100 calls/day).
+**API call cost: 1 per WC player (~736 total).** On the free tier (100 calls/day) this step takes ~8 days, or upgrade to a paid plan.
 
-| League ID | Competition |
-|-----------|-------------|
-| 39 | Premier League |
-| 140 | La Liga |
-| 78 | Bundesliga |
-| 135 | Serie A |
-| 61 | Ligue 1 |
-| 2 | Champions League |
-| 88 | Eredivisie |
-| 94 | Primeira Liga |
-| 203 | Süper Lig |
+### Step 5 — Fetch per-match player statistics
+
+Now that we know each player's club, the pipeline fetches completed fixtures only for those clubs, then fetches per-match player stats for each fixture. Non-WC players are automatically excluded.
+
+```bash
+python pipeline.py fetch-wc-match-stats
+python pipeline.py fetch-wc-match-stats --season 2025   # default
+```
+
+**API call cost: 1 per club (fixture list) + 1 per completed match.** Fixtures shared by two clubs (e.g. PSG vs Man City) are fetched only once.
 
 ### Run everything at once
 
 ```bash
-python pipeline.py run-all --season 2025 --leagues 39,140,78,135,61
+python pipeline.py run-all --season 2025
 ```
 
 ---

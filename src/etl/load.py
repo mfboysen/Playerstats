@@ -146,8 +146,8 @@ class Loader:
             INSERT INTO dim_player
                 (player_id, api_player_id, name, firstname, lastname,
                  nationality, birth_date, age, height, weight,
-                 position, photo_url, world_cup_team_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 position, photo_url, world_cup_team_id, club_team_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (api_player_id) DO UPDATE SET
                 name               = excluded.name,
                 firstname          = COALESCE(excluded.firstname, dim_player.firstname),
@@ -159,8 +159,12 @@ class Loader:
                 weight             = COALESCE(excluded.weight, dim_player.weight),
                 position           = COALESCE(excluded.position, dim_player.position),
                 photo_url          = COALESCE(excluded.photo_url, dim_player.photo_url),
-                world_cup_team_id  = COALESCE(excluded.world_cup_team_id, dim_player.world_cup_team_id)
+                world_cup_team_id  = COALESCE(excluded.world_cup_team_id, dim_player.world_cup_team_id),
+                club_team_id       = COALESCE(excluded.club_team_id, dim_player.club_team_id)
         """
+
+        # Build api_team_id -> team_id map for resolving club_team_id
+        team_id_map = self.get_team_id_map()
 
         rows = []
         for p in players:
@@ -174,6 +178,11 @@ class Loader:
             wc_team_id = p.get("world_cup_team_id")
             if wc_team_id is not None:
                 wc_team_id = int(wc_team_id)
+            # Resolve club_api_team_id to DB surrogate
+            club_api_id = p.get("club_api_team_id")
+            club_team_id = team_id_map.get(club_api_id) if club_api_id else p.get("club_team_id")
+            if club_team_id is not None:
+                club_team_id = int(club_team_id)
             rows.append(
                 (
                     surrogate_id,
@@ -189,6 +198,7 @@ class Loader:
                     p.get("position"),
                     p.get("photo_url"),
                     wc_team_id,
+                    club_team_id,
                 )
             )
 

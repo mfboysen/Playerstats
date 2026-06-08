@@ -212,6 +212,28 @@ class FootballAPIClient:
             "total_pages": total_pages,
         }
 
+    def get_fixtures_by_team(
+        self, team_id: int, season: int, status: str = "FT"
+    ) -> list:
+        """
+        Fetch all completed fixtures for a club team in a given season.
+
+        Args:
+            team_id: API club team ID
+            season: Season year (e.g. 2025)
+            status: Fixture status filter ('FT' = full time / finished)
+
+        Returns:
+            Flat list of raw fixture objects
+        """
+        logger.info("Fetching fixtures for club team_id=%d season=%d", team_id, season)
+        result = self._get(
+            "/fixtures",
+            params={"team": team_id, "season": season, "status": status},
+        )
+        logger.info("Club team %d: %d fixtures found", team_id, len(result))
+        return result
+
     def get_fixtures_page(self, league_id: int, season: int, page: int = 1) -> dict:
         """
         Fetch one page of fixtures for a league/season.

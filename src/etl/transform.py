@@ -567,6 +567,16 @@ def enrich_players_from_stats(
                 break
 
         existing = existing_players.get(api_player_id, {})
+
+        # Pick the club team from the stat with the most appearances
+        club_api_team_id = None
+        best_appearances = -1
+        for stat in record.get("statistics", []):
+            apps = _safe_int(stat.get("games", {}).get("appearences"))
+            if apps > best_appearances:
+                best_appearances = apps
+                club_api_team_id = stat.get("team", {}).get("id")
+
         seen[api_player_id] = {
             "api_player_id": api_player_id,
             "name": player_info.get("name", "Unknown"),
@@ -580,6 +590,7 @@ def enrich_players_from_stats(
             "position": position,
             "photo_url": player_info.get("photo"),
             "world_cup_team_id": existing.get("world_cup_team_id"),
+            "club_api_team_id": club_api_team_id,  # resolved to DB ID during load
         }
 
     rows = list(seen.values())
